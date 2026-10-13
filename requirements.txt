@@ -1,0 +1,8 @@
+streamlit
+chromadb
+langchain-text-splitters
+python-dotenv
+pypdf
+langchain-openrouter
+pydantic
+pyarrow
