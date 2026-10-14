@@ -6,3 +6,5 @@ pypdf
 langchain-openrouter
 pydantic
 pyarrow
+e2b-code-interpreter==2.11.0
+e2b==2.56.0

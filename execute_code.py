@@ -1,14 +1,16 @@
-"""Run reviewed Python snippets in a separate process.
+"""Code runner tool: execute Python strings using E2B or an explicit local mode.
 
-This local learning tool is not a security sandbox: executed code retains
-the operating-system permissions of the current user. Do not expose this
-runner to untrusted users. Deployments need a separate sandbox service.
+E2B is the default backend for deployed apps. Each request gets a fresh external
+sandbox with no application environment variables and no outbound internet.
+Local subprocess execution requires CODE_RUNNER_BACKEND=local and
+ALLOW_LOCAL_CODE_EXECUTION=true; it is intended only for your own computer.
 """
 
 import argparse
 import ast
 import math
 import os
+from importlib.util import find_spec
 import signal
 import subprocess
 import sys
@@ -16,6 +18,161 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+
+PROJECT_DIR = Path(__file__).resolve().parent
+MAX_SOURCE_BYTES = 100_000
+
+
+def get_runner_configuration() -> dict:
+    """Describe the selected runner without returning any credentials."""
+    load_dotenv(PROJECT_DIR / ".env")
+    backend = os.getenv("CODE_RUNNER_BACKEND", "e2b").strip().lower()
+    if backend == "e2b":
+        api_key = os.getenv("E2B_API_KEY", "").strip()
+        if not api_key or api_key in {"your_e2b_api_key_here", "PASTE_YOUR_E2B_KEY_HERE"}:
+            message = "Set E2B_API_KEY in Streamlit secrets or your local .env to enable the external runner."
+        elif find_spec("e2b_code_interpreter") is None:
+            message = "Install the updated requirements.txt, which includes e2b-code-interpreter."
+        else:
+            message = "Python runs in a fresh external E2B sandbox."
+            return {"backend": backend, "available": True, "message": message}
+    elif backend == "local":
+        if os.getenv("ALLOW_LOCAL_CODE_EXECUTION", "false").strip().lower() == "true":
+            return {"backend": backend, "available": True, "message": "Python runs using this computer's operating-system permissions."}
+        message = "Local execution requires ALLOW_LOCAL_CODE_EXECUTION=true. Use the E2B backend for deployment."
+    else:
+        message = "CODE_RUNNER_BACKEND must be e2b or local."
+    return {"backend": backend, "available": False, "message": message}
+
+
+def _empty_result(backend: str, *, message: str = "") -> dict:
+    return {
+        "status": "RUNNER_ERROR", "backend": backend,
+        "stdout": "", "stderr": "", "exit_code": None,
+        "execution_seconds": 0.0, "message": message,
+    }
+
+
+class _OutputLimitExceeded(Exception):
+    """Stop receiving output and destroy the sandbox after exceeding the cap."""
+
+
+def _execute_e2b(code: str, *, timeout_seconds: float, max_output_bytes: int) -> dict:
+    """Run a script remotely and normalize E2B's command results for the assistant."""
+    from e2b import AuthenticationException, CommandExitException, RateLimitException, TimeoutException
+    from e2b_code_interpreter import Sandbox
+
+    result = _empty_result("e2b")
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    sandbox = None
+    execution_started = False
+    started = time.monotonic()
+
+    def capture(stream_name: str, chunk: str) -> None:
+        data = chunk.encode("utf-8")
+        remaining = max_output_bytes - sum(len(buffer) for buffer in buffers.values())
+        buffers[stream_name].extend(data[:remaining])
+        if len(data) > remaining:
+            raise _OutputLimitExceeded()
+
+    try:
+        sandbox = Sandbox.create(
+            api_key=os.environ["E2B_API_KEY"].strip(),
+            timeout=math.ceil(timeout_seconds) + 30,
+            request_timeout=20,
+            secure=True,
+            allow_internet_access=False,
+            network={"allow_public_traffic": False},
+            envs={},
+        )
+        # Send source as file content; the command is fixed and never interpolates code.
+        sandbox.files.write("/tmp/assistant_snippet.py", code, request_timeout=15)
+        execution_started = True
+        try:
+            command = sandbox.commands.run(
+                "python3 -I -X utf8 -u /tmp/assistant_snippet.py",
+                cwd="/tmp",
+                stdin=False,
+                timeout=timeout_seconds,
+                on_stdout=lambda text: capture("stdout", text),
+                on_stderr=lambda text: capture("stderr", text),
+            )
+        except CommandExitException as error:
+            command = error
+        result.update(
+            status="SUCCESS" if command.exit_code == 0 else "ERROR",
+            exit_code=command.exit_code,
+            message="" if command.exit_code == 0 else "The snippet exited with an error; see stderr.",
+        )
+    except _OutputLimitExceeded:
+        result.update(status="OUTPUT_LIMIT", message=f"Stopped after exceeding {max_output_bytes} output bytes.")
+    except TimeoutException:
+        if execution_started:
+            result.update(status="TIMEOUT", message=f"Execution exceeded the {timeout_seconds:g}-second command limit.")
+        else:
+            result["message"] = "The sandbox could not be prepared before the service request timed out. Try again."
+    except AuthenticationException:
+        result["message"] = "E2B rejected authentication. Check E2B_API_KEY in the app's secrets."
+    except RateLimitException:
+        result["message"] = "E2B's request or sandbox limit was reached. Check your account and retry later."
+    except Exception as error:
+        # Provider exceptions can contain request data. Never expose their raw payloads.
+        result["message"] = f"External runner request failed ({type(error).__name__}). Check E2B service availability and account credits."
+    finally:
+        if sandbox is not None:
+            try:
+                sandbox.kill(request_timeout=5)
+            except Exception:
+                result["cleanup_warning"] = "Sandbox cleanup could not be confirmed. Its short lifetime will expire automatically."
+        result["stdout"] = buffers["stdout"].decode("utf-8", errors="ignore")
+        result["stderr"] = buffers["stderr"].decode("utf-8", errors="ignore")
+        result["execution_seconds"] = round(time.monotonic() - started, 3)
+    return result
+
+
+def execute_code(
+    code: str,
+    *,
+    timeout_seconds: float = 5.0,
+    max_output_bytes: int = 16_384,
+) -> dict:
+    """Tool boundary: accept source text and return captured execution results.
+
+    The assistant/router calls this tool; the LLM never interprets or executes
+    Python. External failures do not fall back to running on the Streamlit host.
+    """
+    if not isinstance(code, str) or not code.strip():
+        raise ValueError("Provide non-empty Python source code.")
+    if not math.isfinite(timeout_seconds) or timeout_seconds <= 0 or timeout_seconds > 30:
+        raise ValueError("timeout_seconds must be finite, positive, and at most 30 seconds.")
+    if isinstance(max_output_bytes, bool) or not isinstance(max_output_bytes, int) or max_output_bytes <= 0:
+        raise ValueError("max_output_bytes must be a positive integer.")
+    configuration = get_runner_configuration()
+    backend = configuration["backend"]
+    if len(code.encode("utf-8")) > MAX_SOURCE_BYTES:
+        return _empty_result(backend, message=f"Source exceeds the {MAX_SOURCE_BYTES}-byte limit.")
+    try:
+        ast.parse(code, filename="snippet.py")
+    except SyntaxError as error:
+        return {
+            **_empty_result(backend), "status": "SYNTAX_ERROR",
+            "stderr": f"{type(error).__name__}: {error.msg} (line {error.lineno})",
+            "message": "The source could not be parsed; nothing was executed.",
+        }
+    if not configuration["available"]:
+        return _empty_result(backend, message=configuration["message"])
+    if backend == "e2b":
+        try:
+            return _execute_e2b(code, timeout_seconds=timeout_seconds, max_output_bytes=max_output_bytes)
+        except ImportError:
+            return _empty_result(backend, message="The E2B SDK could not be imported. Reinstall the updated requirements.txt.")
+    return {
+        **_execute_local_code(code, timeout_seconds=timeout_seconds, max_output_bytes=max_output_bytes),
+        "backend": "local",
+    }
 
 
 def _stop_process_tree(process: subprocess.Popen) -> None:
@@ -44,7 +201,7 @@ def _stop_process_tree(process: subprocess.Popen) -> None:
     process.wait(timeout=3)
 
 
-def execute_code(
+def _execute_local_code(
     code: str,
     *,
     timeout_seconds: float = 5.0,
@@ -177,10 +334,13 @@ def execute_code(
 
 
 def _print_result(result: dict) -> None:
+    print(f"Runner: {result.get('backend', 'unknown')}")
     print(f"Status: {result['status']}")
     print(f"Exit code: {result['exit_code']}")
     if result["message"]:
         print(f"Message: {result['message']}")
+    if result.get("cleanup_warning"):
+        print(result["cleanup_warning"])
     print("Standard output:")
     print(result["stdout"].rstrip() or "(empty)")
     print("Standard error:")
@@ -188,7 +348,7 @@ def _print_result(result: dict) -> None:
 
 
 def run_demo() -> None:
-    """Exercise success, error capture, and timeout without any API calls."""
+    """Exercise success, errors, and timeout; E2B mode makes three billed API runs."""
     cases = [
         ("Successful execution", 'print("Hello from the code runner!")\nprint(2 + 3)',
          "SUCCESS", 5.0),
@@ -205,7 +365,7 @@ def run_demo() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Execute reviewed local Python snippets.")
+    parser = argparse.ArgumentParser(description="Execute reviewed Python snippets with the configured code runner.")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--demo", action="store_true", help="Run three built-in checks.")
     source.add_argument("--code", help="Python source code as a string.")

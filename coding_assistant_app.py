@@ -4,8 +4,8 @@ Install: python -m pip install streamlit
 Run: python -m streamlit run coding_assistant_app.py --server.address 127.0.0.1 --server.fileWatcherType none
 
 Missing HumanEval references are initialized on the server's first startup.
-The local runner requires ALLOW_LOCAL_CODE_EXECUTION=true. Keep that option
-disabled on hosted deployments; it uses the server's operating-system permissions.
+Hosted execution uses the external E2B sandbox. Local execution is an explicit
+opt-in mode for your own computer.
 Final generation and explanation answers stream directly from the model.
 """
 
@@ -28,6 +28,7 @@ from assistant_router import (
 )
 from conversation_memory import ConversationMemory
 from answer_streaming import AnswerStreamError
+from execute_code import get_runner_configuration
 
 
 LOGGER = logging.getLogger(__name__)
@@ -45,7 +46,10 @@ def configure_app() -> None:
         secrets = dict(st.secrets)
     except FileNotFoundError:
         secrets = {}
-    for name in ("OPENROUTER_API_KEY", "OPENROUTER_MODEL", "ALLOW_LOCAL_CODE_EXECUTION"):
+    for name in (
+        "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "ALLOW_LOCAL_CODE_EXECUTION",
+        "CODE_RUNNER_BACKEND", "E2B_API_KEY",
+    ):
         if name in secrets:
             value = secrets[name]
             if not isinstance(value, (str, bool)):
@@ -58,8 +62,8 @@ def configure_app() -> None:
         raise AppSetupError("Set OPENROUTER_MODEL in Streamlit Settings → Secrets, or in .env for local use.")
 
 
-def local_execution_allowed() -> bool:
-    return os.getenv("ALLOW_LOCAL_CODE_EXECUTION", "false").strip().lower() == "true"
+def execution_available() -> bool:
+    return get_runner_configuration()["available"]
 
 
 def log_failure(operation: str, error: Exception) -> None:
@@ -219,6 +223,10 @@ def render_execution(execution: dict) -> None:
         st.error(f"Execution status: {status}")
     if execution.get("message") and status != "SKIPPED":
         st.caption(execution["message"])
+    if execution.get("backend"):
+        st.caption("Runner: E2B sandbox" if execution["backend"] == "e2b" else "Runner: local Python")
+    if execution.get("cleanup_warning"):
+        st.warning(execution["cleanup_warning"])
     st.caption(f"Exit code: {execution.get('exit_code')}")
     st.markdown("**Standard output**")
     st.code(execution.get("stdout", "").rstrip() or "(empty)", language="text")
@@ -269,12 +277,12 @@ def render_turn(turn: dict, index: int, settings: dict) -> None:
         if st.button(
             "Run code",
             key=prefix + "_button",
-            disabled=not (settings["allow_execution"] and local_execution_allowed()),
+            disabled=not (settings["allow_execution"] and execution_available()),
         ):
-            if not local_execution_allowed():
-                st.error("Code execution is disabled for this deployment.")
+            if not execution_available():
+                st.error(get_runner_configuration()["message"])
                 return
-            with st.spinner("Executing selected Python code..."):
+            with st.spinner("Running selected Python code..."):
                 execution = execute_generated_answer(
                     result,
                     timeout_seconds=settings["timeout"],
@@ -313,14 +321,11 @@ def render_sidebar() -> dict:
             st.rerun()
         st.divider()
         st.header("Execution")
-        execution_available = local_execution_allowed()
+        runner = get_runner_configuration()
         allow_execution = st.checkbox(
-            "Enable local code execution", value=False, disabled=not execution_available
-        ) and execution_available
-        if execution_available:
-            st.caption("Review code before running it. It uses the server account's permissions.")
-        else:
-            st.caption("Code execution is disabled. A local installation can opt in using ALLOW_LOCAL_CODE_EXECUTION=true in .env.")
+            "Enable code execution", value=False, disabled=not runner["available"]
+        ) and runner["available"]
+        st.caption(runner["message"])
         timeout = st.number_input(
             "Timeout in seconds", min_value=0.2, max_value=30.0, value=5.0, step=0.2
         )
