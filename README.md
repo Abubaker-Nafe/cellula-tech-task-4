@@ -24,17 +24,79 @@ Developed by **Nafe Abubaker** during the **AI Engineer Internship at Cellula Te
 
 ```mermaid
 flowchart TD
-    Q["User request and recent conversation history"] --> C{"LLM intent classifier"}
-    C -->|EXPLAIN| E["Direct code explanation"]
-    C -->|GENERATE| R["Resolve contextual request"]
-    R --> D["Retrieve top 3 Chroma references"]
-    D --> V{"LLM relevance evaluation"}
-    V -->|Relevant| G["Generate from approved references"]
-    V -->|Not relevant| N["Ask the user for a reference"]
-    N --> F["Validate and store a supplied solution"]
-    F -. Future retrieval .-> D
-    E --> A["Stream answer and save completed turn"]
-    G --> A
+    Q["User Query
+    (Question / Request)"]
+    C["Intent Classification
+    LLM Classifier
+    (Explain Code / Generate Code)"]
+    E["Explain Code
+    User wants explanation
+    of existing code"]
+    L["LLM
+    Analyze code and
+    generate explanation"]
+    G["Generate Code
+    User wants code
+    to be generated"]
+    R["Retrieve from Chroma
+    Vector Search
+    (Top-K Relevant Documents)"]
+    V["LLM Relevance Check
+    Is the retrieved context
+    relevant to the query?"]
+    YES["Relevant"]
+    NO["Not Relevant"]
+    A["LLM Code Generation
+    Generate high-quality
+    code using retrieved context"]
+    N["Ask User for Solution
+    Inform user that no relevant
+    information was found and
+    ask for the correct solution"]
+    X["Code Runner Tool
+    Execute code in a safe
+    environment"]
+    S["Store Solution in Chroma
+    Embed the solution and
+    store it in the vector DB"]
+    F["Final Response
+    Return answer / explanation /
+    execution result to user"]
+
+    Q --> C
+    C --> E
+    C --> G
+    E --> L
+    G --> R
+    R --> V
+    V --> YES
+    V --> NO
+    YES --> A
+    NO --> N
+    A --> X
+    N --> S
+    L --> F
+    X --> F
+    S --> F
+
+    classDef main fill:#061126,stroke:#2563b5,color:#ffffff;
+    classDef intent fill:#110923,stroke:#6345b4,color:#ffffff;
+    classDef explain fill:#061b0d,stroke:#40963b,color:#ffffff;
+    classDef generate fill:#231c06,stroke:#c99b20,color:#ffffff;
+    classDef retrieval fill:#051d23,stroke:#35a7b1,color:#ffffff;
+    classDef relevance fill:#140b26,stroke:#8851d0,color:#ffffff;
+    classDef relevant fill:#162407,stroke:#85a72b,color:#ffffff;
+    classDef feedback fill:#290b13,stroke:#ce3e51,color:#ffffff;
+    classDef runner fill:#291807,stroke:#d98517,color:#ffffff;
+    class Q,L,A,F main;
+    class C intent;
+    class E explain;
+    class G generate;
+    class R,S retrieval;
+    class V relevance;
+    class YES relevant;
+    class NO,N feedback;
+    class X runner;
 ```
 
 The **Run code** button passes a selected generated Python block to the execution tool. Execution results are recorded as another conversation turn so later questions can refer to both the code and its output.
