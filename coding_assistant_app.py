@@ -1,15 +1,18 @@
-"""Local Streamlit interface for the Task-4 coding assistant.
+"""Streamlit interface for the Task-4 coding assistant.
 
 Install: python -m pip install streamlit
 Run: python -m streamlit run coding_assistant_app.py --server.address 127.0.0.1 --server.fileWatcherType none
 
-The local runner uses your operating-system permissions. Keep this prototype
-local; public hosting requires a sandboxed runner and access controls.
+Missing HumanEval references are initialized on the server's first startup.
+The local runner requires ALLOW_LOCAL_CODE_EXECUTION=true. Keep that option
+disabled on hosted deployments; it uses the server's operating-system permissions.
 Final generation and explanation answers stream directly from the model.
 """
 
+import logging
 import os
 import re
+import traceback
 from pathlib import Path
 from uuid import uuid4
 
@@ -27,6 +30,83 @@ from conversation_memory import ConversationMemory
 from answer_streaming import AnswerStreamError
 
 
+LOGGER = logging.getLogger(__name__)
+PROJECT_DIR = Path(__file__).resolve().parent
+
+
+class AppSetupError(ValueError):
+    """A configuration problem with a safe, actionable display message."""
+
+
+def configure_app() -> None:
+    """Use Streamlit secrets when present, with .env support for local use."""
+    load_dotenv(PROJECT_DIR / ".env")
+    try:
+        secrets = dict(st.secrets)
+    except FileNotFoundError:
+        secrets = {}
+    for name in ("OPENROUTER_API_KEY", "OPENROUTER_MODEL", "ALLOW_LOCAL_CODE_EXECUTION"):
+        if name in secrets:
+            value = secrets[name]
+            if not isinstance(value, (str, bool)):
+                raise AppSetupError(f"{name} must be a quoted string or a boolean in Streamlit secrets.")
+            os.environ[name] = str(value).strip()
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not api_key or api_key in {"your_actual_key_here", "your_openrouter_api_key_here"}:
+        raise AppSetupError("Set OPENROUTER_API_KEY in Streamlit Settings → Secrets, or in .env for local use.")
+    if not os.getenv("OPENROUTER_MODEL", "").strip():
+        raise AppSetupError("Set OPENROUTER_MODEL in Streamlit Settings → Secrets, or in .env for local use.")
+
+
+def local_execution_allowed() -> bool:
+    return os.getenv("ALLOW_LOCAL_CODE_EXECUTION", "false").strip().lower() == "true"
+
+
+def log_failure(operation: str, error: Exception) -> None:
+    """Log failure locations without printing prompts, secrets, or SDK payloads."""
+    LOGGER.error(
+        "%s failed (%s): %s\n%s",
+        operation,
+        type(error).__name__,
+        friendly_error(error),
+        "".join(traceback.format_tb(error.__traceback__)),
+    )
+
+
+@st.cache_resource(show_spinner=False)
+def initialize_knowledge_base() -> int:
+    """Add missing base references once per server process; retain user feedback."""
+    from vector_store import get_collection
+
+    collection = get_collection()
+    dataset_path = PROJECT_DIR / "data" / "test-00000-of-00001.parquet"
+    if not dataset_path.is_file():
+        if collection.count():
+            return collection.count()
+        raise AppSetupError(
+            "The knowledge base is empty. Include data/test-00000-of-00001.parquet "
+            "in the GitHub repository so the app can build it on startup."
+        )
+
+    from prepare_dataset import prepare_documents
+
+    records = prepare_documents(dataset_path)
+    if not records:
+        raise AppSetupError("The HumanEval dataset is empty. Upload the original Parquet dataset.")
+    existing_ids = set(collection.get(ids=[record["id"] for record in records], include=[])["ids"])
+    missing = [record for record in records if record["id"] not in existing_ids]
+    for start in range(0, len(missing), 32):
+        batch = missing[start:start + 32]
+        collection.upsert(
+            ids=[record["id"] for record in batch],
+            documents=[record["document"] for record in batch],
+            metadatas=[record["metadata"] for record in batch],
+        )
+    count = collection.count()
+    LOGGER.info("Knowledge base ready: %d references; %d base references added.", count, len(missing))
+    return count
+
+
 def new_conversation_id() -> str:
     return "ui_" + uuid4().hex[:12]
 
@@ -42,6 +122,8 @@ def load_turns(conversation_id: str) -> list[dict]:
 def friendly_error(error: Exception) -> str:
     """Describe API failures without displaying credentials or request data."""
     name = type(error).__name__
+    if isinstance(error, AppSetupError):
+        return str(error)
     if isinstance(error, AnswerStreamError):
         return str(error)
     if "TooManyRequests" in name or "RateLimit" in name:
@@ -50,7 +132,15 @@ def friendly_error(error: Exception) -> str:
         return "No endpoint was available for the configured model. Check OPENROUTER_MODEL."
     if "Unauthorized" in name or "Authentication" in name:
         return "The model provider rejected authentication. Check your API key configuration."
-    return f"The request could not complete ({name}). Check your terminal and project configuration."
+    if isinstance(error, ValueError):
+        known_errors = {
+            "Add your OpenRouter API key to .env.": "OPENROUTER_API_KEY is missing. Check the app's secrets or your local .env.",
+            "Add OPENROUTER_MODEL to .env.": "OPENROUTER_MODEL is missing. Check the app's secrets or your local .env.",
+            "The knowledge base is empty. Run build_knowledge_base.py.": "The knowledge base is empty. Restart the updated app to initialize the HumanEval references.",
+        }
+        if str(error) in known_errors:
+            return known_errors[str(error)]
+    return f"The request could not complete ({name}). Open Manage app → logs on Streamlit Cloud, or check your local terminal."
 
 
 def submit_query(
@@ -83,6 +173,7 @@ def submit_query(
                 on_token=display_chunk if stream_answers else None,
             )
         except Exception as error:
+            log_failure("Request", error)
             result = {
                 "intent": "UNKNOWN",
                 "status": "REQUEST_ERROR",
@@ -178,8 +269,11 @@ def render_turn(turn: dict, index: int, settings: dict) -> None:
         if st.button(
             "Run code",
             key=prefix + "_button",
-            disabled=not settings["allow_execution"],
+            disabled=not (settings["allow_execution"] and local_execution_allowed()),
         ):
+            if not local_execution_allowed():
+                st.error("Code execution is disabled for this deployment.")
+                return
             with st.spinner("Executing selected Python code..."):
                 execution = execute_generated_answer(
                     result,
@@ -219,8 +313,14 @@ def render_sidebar() -> dict:
             st.rerun()
         st.divider()
         st.header("Execution")
-        allow_execution = st.checkbox("Enable local code execution", value=False)
-        st.caption("Review code before running it. It uses your local account's permissions.")
+        execution_available = local_execution_allowed()
+        allow_execution = st.checkbox(
+            "Enable local code execution", value=False, disabled=not execution_available
+        ) and execution_available
+        if execution_available:
+            st.caption("Review code before running it. It uses the server account's permissions.")
+        else:
+            st.caption("Code execution is disabled. A local installation can opt in using ALLOW_LOCAL_CODE_EXECUTION=true in .env.")
         timeout = st.number_input(
             "Timeout in seconds", min_value=0.2, max_value=30.0, value=5.0, step=0.2
         )
@@ -266,12 +366,25 @@ def render_feedback(turns: list[dict], *, stream_answers: bool = True) -> None:
 
 def main() -> None:
     st.set_page_config(page_title="Cellula Coding Assistant", page_icon="💻", layout="wide")
-    load_dotenv(Path(__file__).resolve().parent / ".env")
+    try:
+        configure_app()
+    except Exception as error:
+        log_failure("Configuration", error)
+        st.error(friendly_error(error))
+        st.stop()
     if "conversation_id" not in st.session_state:
         st.session_state.conversation_id = new_conversation_id()
     settings = render_sidebar()
     st.title("Cellula Coding Assistant")
     st.caption("Generate code, understand it, and reuse knowledge from your references.")
+    try:
+        with st.spinner("Preparing the reference database; the first startup may download the embedding model..."):
+            reference_count = initialize_knowledge_base()
+    except Exception as error:
+        log_failure("Knowledge base initialization", error)
+        st.error(friendly_error(error))
+        st.stop()
+    st.caption(f"Reference database ready: {reference_count} references.")
     try:
         turns = load_turns(st.session_state.conversation_id)
     except Exception as error:
