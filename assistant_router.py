@@ -3,9 +3,11 @@ import json
 import math
 import re
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 from conversation_memory import ConversationMemory
+from answer_streaming import stream_explanation
 from execute_code import execute_code
 from explain_code import explain_code
 from generate_code import generate_code
@@ -13,7 +15,7 @@ from intent_classifier import classify_intent
 from learn_from_feedback import learn_from_feedback
 
 
-TRANSIENT_ERROR_STATUSES = {"CONTEXT_ERROR", "FEEDBACK_ERROR"}
+TRANSIENT_ERROR_STATUSES = {"CONTEXT_ERROR", "FEEDBACK_ERROR", "EVALUATION_ERROR"}
 
 
 def find_pending_request(turns: list[dict]) -> str | None:
@@ -120,6 +122,7 @@ def route_query(
     execute_generated: bool = False,
     execution_timeout: float = 5.0,
     code_block_index: int | None = None,
+    on_token: Callable[[str], None] | None = None,
 ) -> dict:
     """Load history, route the request, and save the completed turn."""
     user_query = user_query.strip()
@@ -156,10 +159,14 @@ def route_query(
         )
 
     if intent == "EXPLAIN":
+        if on_token is None:
+            answer = explain_code(saved_query, history=history)
+        else:
+            answer = stream_explanation(saved_query, history=history, on_token=on_token)
         result = {
             "intent": intent,
             "status": "EXPLAINED",
-            "answer": explain_code(saved_query, history=history),
+            "answer": answer,
             "source_ids": [],
             "evaluation_reason": None,
         }
@@ -210,7 +217,7 @@ def route_query(
     elif intent == "GENERATE":
         result = {
             "intent": intent,
-            **generate_code(user_query, history=history),
+            **generate_code(user_query, history=history, on_token=on_token),
         }
 
     else:
@@ -315,6 +322,10 @@ def main():
     if args.debug_context and result.get("context_diagnostics"):
         print("\nContext diagnostics:")
         print(json.dumps(result["context_diagnostics"], indent=2))
+
+    if result.get("evaluation_diagnostics"):
+        print("\nEvaluation diagnostics:")
+        print(json.dumps(result["evaluation_diagnostics"], indent=2))
 
     print("\nAnswer:\n")
     print(result["answer"])

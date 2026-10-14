@@ -1,9 +1,10 @@
 import argparse
 import json
+from collections.abc import Callable
 
 from intent_classifier import classify_intent
-from llm_client import get_llm
-from relevance_evaluator import evaluate_relevance
+from answer_streaming import collect_answer
+from relevance_evaluator import RelevanceEvaluationError, evaluate_relevance
 from retrieve_code import retrieve_examples
 from context_resolver import ContextResolutionError, resolve_request
 
@@ -38,6 +39,8 @@ Do not claim that you executed or tested the generated code.
 def generate_code(
     user_query: str,
     history: list[dict] | None = None,
+    *,
+    on_token: Callable[[str], None] | None = None,
 ) -> dict:
     """Generate code using resolved context and approved references."""
     if not user_query.strip():
@@ -60,7 +63,21 @@ def generate_code(
         }
 
     examples = retrieve_examples(resolved_request)
-    evaluation = evaluate_relevance(resolved_request, examples)
+    try:
+        evaluation = evaluate_relevance(resolved_request, examples)
+    except RelevanceEvaluationError as error:
+        return {
+            "status": "EVALUATION_ERROR",
+            "answer": (
+                "The relevance evaluator could not return a valid decision after "
+                "two attempts. No code was generated. Check the evaluation diagnostics "
+                "and the configured model, then retry."
+            ),
+            "source_ids": [],
+            "evaluation_reason": None,
+            "resolved_request": resolved_request,
+            "evaluation_diagnostics": error.diagnostics,
+        }
 
     if evaluation.status == "NOT_RELEVANT":
         return {
@@ -117,15 +134,7 @@ def generate_code(
         "content": json.dumps(payload, ensure_ascii=False),
     })
 
-    response = get_llm(max_tokens=4096).invoke(messages)
-
-    if not isinstance(response.content, str):
-        raise ValueError("The generator returned unexpected content.")
-
-    answer = response.content.strip()
-
-    if not answer:
-        raise ValueError("The generator returned an empty response.")
+    answer = collect_answer(messages, max_tokens=4096, on_token=on_token)
 
     return {
         "status": "GENERATED",
