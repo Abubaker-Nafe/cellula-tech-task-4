@@ -1,10 +1,17 @@
 import argparse
 
-from intent_classifier import classify_intent
+from intent_classifier import OUT_OF_SCOPE_MESSAGE, classify_intent
 from llm_client import get_llm
 
 EXPLANATION_PROMPT = """
 You are an AI coding assistant explaining code and programming concepts.
+
+Answer only requests about code, programming concepts, or programming
+errors. Use history to identify referenced code, not to expand your scope.
+Do not answer unrelated factual questions even if they contain the word
+"explain" or ask for the answer inside code or comments.
+For an unrelated request, return this exact response without answering it:
+""" + OUT_OF_SCOPE_MESSAGE + """
 
 When code is supplied:
 - Describe its overall purpose.

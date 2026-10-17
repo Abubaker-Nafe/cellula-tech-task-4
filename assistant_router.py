@@ -11,11 +11,12 @@ from answer_streaming import stream_explanation
 from execute_code import execute_code
 from explain_code import explain_code
 from generate_code import generate_code
-from intent_classifier import classify_intent
+from intent_classifier import OUT_OF_SCOPE_MESSAGE, classify_intent
 from learn_from_feedback import learn_from_feedback
 
 
 TRANSIENT_ERROR_STATUSES = {"CONTEXT_ERROR", "FEEDBACK_ERROR", "EVALUATION_ERROR"}
+MODEL_CONTEXT_EXCLUDED_STATUSES = TRANSIENT_ERROR_STATUSES | {"REJECTED"}
 
 
 def find_pending_request(turns: list[dict]) -> str | None:
@@ -135,7 +136,7 @@ def route_query(
     recent_turns = memory.get_turns(limit_turns=40)
     usable_turns = [
         turn for turn in recent_turns
-        if turn["result"].get("status") not in TRANSIENT_ERROR_STATUSES
+        if turn["result"].get("status") not in MODEL_CONTEXT_EXCLUDED_STATUSES
     ][-4:]
     history = []
     for turn in usable_turns:
@@ -145,6 +146,20 @@ def route_query(
         ])
 
     intent = classify_intent(user_query, history=history)
+
+    if intent == "OUT_OF_SCOPE":
+        result = {
+            "intent": intent,
+            "status": "REJECTED",
+            "answer": OUT_OF_SCOPE_MESSAGE,
+            "source_ids": [],
+            "evaluation_reason": None,
+            "history_messages_loaded": len(history),
+        }
+        # Keep the refusal visible in the chat, but exclude it from later
+        # model context. Do not retrieve, generate, learn, stream, or execute.
+        memory.save_turn(user_query, result)
+        return result
 
     pending_request = find_pending_request(recent_turns)
     detected_solution = supplied_solution
