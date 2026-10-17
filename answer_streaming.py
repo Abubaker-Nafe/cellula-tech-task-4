@@ -1,7 +1,6 @@
 """Collect complete LLM answers while optionally forwarding visible text chunks."""
 
 from collections.abc import Callable
-
 from llm_client import get_llm
 
 

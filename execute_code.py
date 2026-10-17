@@ -1,11 +1,3 @@
-"""Code runner tool: execute Python strings using E2B or an explicit local mode.
-
-E2B is the default backend for deployed apps. Each request gets a fresh external
-sandbox with no application environment variables and no outbound internet.
-Local subprocess execution requires CODE_RUNNER_BACKEND=local and
-ALLOW_LOCAL_CODE_EXECUTION=true; it is intended only for your own computer.
-"""
-
 import argparse
 import ast
 import math

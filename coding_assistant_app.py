@@ -1,14 +1,3 @@
-"""Streamlit interface for the Task-4 coding assistant.
-
-Install: python -m pip install streamlit
-Run: python -m streamlit run coding_assistant_app.py --server.address 127.0.0.1 --server.fileWatcherType none
-
-Missing HumanEval references are initialized on the server's first startup.
-Hosted execution uses the external E2B sandbox. Local execution is an explicit
-opt-in mode for your own computer.
-Final generation and explanation answers stream directly from the model.
-"""
-
 import logging
 import os
 import re
